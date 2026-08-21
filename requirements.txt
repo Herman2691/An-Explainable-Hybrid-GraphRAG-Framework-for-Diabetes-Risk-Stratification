@@ -9,6 +9,6 @@ scipy
 pandas
 joblib
 neo4j
-mistralai
+mistralai==1.2.5
 python-dotenv
 pyvis
