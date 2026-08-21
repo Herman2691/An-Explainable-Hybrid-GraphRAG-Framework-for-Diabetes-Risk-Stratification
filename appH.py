@@ -1,0 +1,546 @@
+import os
+import time
+import re
+import tempfile
+import numpy as np
+import pandas as pd
+import joblib
+from dotenv import load_dotenv
+
+# Load the .env file
+load_dotenv()
+
+import scipy
+import sklearn
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.preprocessing import StandardScaler
+
+import streamlit as st
+import streamlit.components.v1 as components
+from neo4j import GraphDatabase
+from mistralai import Mistral
+
+# =====================================================================
+# 1. CONFIGURATION AND CONNECTIONS
+# =====================================================================
+# Paths are resolved relative to this file so the app runs anywhere
+# (local machine, Streamlit Community Cloud, …) without a hardcoded path.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(BASE_DIR, "models")
+
+
+def get_secret(key, default=None):
+    """Read a secret from Streamlit Cloud (st.secrets) first, then fall back
+    to environment variables (.env loaded via python-dotenv for local runs)."""
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        # No secrets.toml present (e.g. local dev) -> ignore and use env vars.
+        pass
+    return os.getenv(key, default)
+
+
+@st.cache_resource
+def load_models():
+    knn_path = os.path.join(MODEL_DIR, "modele_knn_diabete.pkl")
+    scaler_path = os.path.join(MODEL_DIR, "scaler_knn.pkl")
+
+    if not os.path.exists(knn_path) or not os.path.exists(scaler_path):
+        st.error(f"❌ Error: KNN model or scaler not found in {MODEL_DIR}")
+        return None, None
+
+    knn = joblib.load(knn_path)
+    scaler = joblib.load(scaler_path)
+    return knn, scaler
+
+knn_model, scaler_model = load_models()
+
+# Neo4j and Mistral AI connections (read from st.secrets or environment)
+NEO4J_URI = get_secret("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USER = get_secret("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = get_secret("NEO4J_PASSWORD")
+MISTRAL_API_KEY = get_secret("MISTRAL_API_KEY")
+
+mistral_client = Mistral(api_key=MISTRAL_API_KEY)
+
+# =====================================================================
+# 2. HALLUCINATION MEASUREMENT FUNCTION (FINAL VERSION)
+# =====================================================================
+
+def evaluer_hallucinations_numeriques(rapport_llm, contexte_graph, donnees_patient_brutes,
+                                       latency_cypher=0.0):
+    """
+    Extended detection of numeric hallucinations:
+    - Raw numbers (integers, decimals)
+    - Explicit percentages (e.g., 72.3%)
+    - Medical units (e.g., 30.5 kg/m², 140 mmHg)
+    - Value ranges (e.g., 25-30, between 20 and 35, >= 40)
+    - Adaptive rounding tolerance depending on the order of magnitude
+
+    Anti-false-positive rules:
+    - R1: The Cypher latency is added to the whitelist (if the AI mentions it, it is valid)
+    - R2: Numbers with < 3 significant digits outside the Neo4j data are ignored
+    """
+
+    # ── 1. Isolate the analytical part ────────────────────────────────────────
+    # NOTE: keywords kept bilingual (FR + EN) so the split still works whether
+    # the LLM report is generated in French or in English.
+    partie_analytique = re.split(
+        r'(?i)(?:recommandations|recommendations|conseils|advice|prévention|prevention|1\.|💡|👉|###\s*2)',
+        rapport_llm
+    )[0].replace(",", ".")
+
+    contexte_net = contexte_graph.replace(",", ".")
+
+    # ── 2. Build the ground-truth base ────────────────────────────────────────
+
+    # 2a. Raw numbers from the graph context
+    verite_brute = set(re.findall(r'\b\d+(?:\.\d+)?\b', contexte_net))
+
+    # 2b. Percentages from the context
+    verite_pct = set(re.findall(r'\b(\d+(?:\.\d+)?)\s*%', contexte_net))
+
+    # 2c. Ranges from the context (e.g., "25-30", "20 to 35", "between 20 and 35")
+    verite_plages = set()
+    for m in re.finditer(
+        r'\b(\d+(?:\.\d+)?)\s*(?:–|-|à|to|et|and)\s*(\d+(?:\.\d+)?)\b',
+        contexte_net, re.IGNORECASE
+    ):
+        verite_plages.update({m.group(1), m.group(2)})
+
+    # 2d. Values from the patient form
+    verite_patient = set()
+    for v in donnees_patient_brutes:
+        verite_patient.update(re.findall(r'\b\d+(?:\.\d+)?\b', str(v).replace(",", ".")))
+
+    # 2e. ✅ R1 — Cypher latency whitelist: all numeric fragments
+    #     of the measured latency (e.g., "0.0023" → {"0", "0023", "0.0023"})
+    verite_latence = set()
+    if latency_cypher > 0.0:
+        latence_str = f"{latency_cypher:.4f}".replace(",", ".")
+        verite_latence = set(re.findall(r'\b\d+(?:\.\d+)?\b', latence_str))
+        # Also add the rounded forms to cover approximate mentions.
+        verite_latence.add(f"{latency_cypher:.2f}")
+        verite_latence.add(f"{latency_cypher:.1f}")
+        verite_latence.add(f"{latency_cypher:.0f}")
+
+    verite_totale = verite_brute | verite_pct | verite_plages | verite_patient | verite_latence
+
+    # ── 3. Extract the values generated by the LLM ────────────────────────────
+
+    # 3a. Explicit percentages in the report
+    pct_rapport = set(re.findall(r'\b(\d+(?:\.\d+)?)\s*%', partie_analytique))
+
+    # 3b. Values with medical units (BMI, blood pressure, glucose…)
+    unites_pattern = r'\b(\d+(?:\.\d+)?)\s*(?:kg/m²|kg/m2|mmHg|g/dL|mg/dL|mmol/L|bpm|cm|kg)\b'
+    valeurs_unites = set(re.findall(unites_pattern, partie_analytique, re.IGNORECASE))
+
+    # 3c. Value ranges in the report
+    plages_rapport = set()
+    for m in re.finditer(
+        r'\b(\d+(?:\.\d+)?)\s*(?:–|-|à|to|et|and)\s*(\d+(?:\.\d+)?)\b',
+        partie_analytique, re.IGNORECASE
+    ):
+        plages_rapport.update({m.group(1), m.group(2)})
+
+    # 3d. Raw numbers (general fallback)
+    nombres_bruts = re.findall(r'\b\d+(?:\.\d+)?\b', partie_analytique)
+
+    # Union of all extracted values (deduplicated)
+    valeurs_generees = list(
+        set(nombres_bruts) | pct_rapport | valeurs_unites | plages_rapport
+    )
+
+    # ── 4. Noise filtering ─────────────────────────────────────────────────────
+    EXCLUSIONS = {str(i) for i in range(6)} | {"13", "100", "250", "0.0"}
+
+    def est_significatif(val_str):
+        """
+        ✅ R2 — Ignore short numbers (< 3 significant digits)
+        that do not come strictly from the Neo4j data.
+        E.g., "10", "12", "99" alone are formatting noise;
+        they are kept only if they already appear in verite_brute.
+        """
+        if val_str in verite_brute:
+            return True                          # confirmed Neo4j value → keep
+        chiffres = val_str.replace(".", "")
+        return len(chiffres.lstrip("0")) >= 3    # >= 3 significant digits
+
+    valeurs_filtrees = [
+        v for v in valeurs_generees
+        if v not in EXCLUSIONS and est_significatif(v)
+    ]
+
+    if not valeurs_filtrees:
+        return 0.0, 0, []
+
+    # ── 5. Verification with adaptive tolerance ───────────────────────────────
+    def est_proche(val_str, verite_set, seuil_relatif=0.05, seuil_absolu=1.5):
+        """
+        Adaptive tolerance:
+        - Small values (<= 10): fixed absolute tolerance (±seuil_absolu)
+        - Large values (> 10) : relative tolerance of 5%
+        Also covers substrings (e.g., "30" in "30.97")
+        """
+        if val_str in verite_set:
+            return True
+        if any(val_str in v for v in verite_set):
+            return True
+        try:
+            v_f = float(val_str)
+            for v_v in verite_set:
+                try:
+                    vv_f = float(v_v)
+                    delta = abs(v_f - vv_f)
+                    seuil = seuil_absolu if vv_f <= 10 else vv_f * seuil_relatif
+                    if delta <= seuil:
+                        return True
+                except ValueError:
+                    pass
+        except ValueError:
+            pass
+        return False
+
+    anomalies = [v for v in valeurs_filtrees if not est_proche(v, verite_totale)]
+
+    th_n = round((len(anomalies) / len(valeurs_filtrees)) * 100, 2)
+    return th_n, len(valeurs_filtrees), anomalies
+
+
+# =====================================================================
+# 2bis. INTERACTIVE NEO4J SUBGRAPH VISUALIZATION (PyVis)
+# =====================================================================
+
+def render_neo4j_subgraph(cluster_id, patient_data, cluster_stats, height="520px"):
+    """
+    Build an interactive HTML view of the Neo4j subgraph for the analyzed patient.
+
+    Structure of the subgraph:
+        - Central node  : the Cluster assigned by the KNN  (large, violet)
+        - Patient node  : the active patient, linked to the Cluster by BELONGS_TO
+                          (bright pink, label "Current Patient")
+        - Metric nodes  : the epidemiological statistics extracted from Neo4j
+                          (neutral green/grey, linked to the Cluster)
+
+    Parameters
+    ----------
+    cluster_id : int
+        Cluster identifier predicted by the KNN.
+    patient_data : dict
+        {readable_label: value} describing the active patient's clinical profile.
+    cluster_stats : dict
+        {readable_label: value} of the metrics extracted from Neo4j
+        (e.g. {"Mean BMI": "30.97", "Hypertension Rate": "81.0%"}).
+    height : str
+        CSS height of the rendered graph.
+
+    Returns
+    -------
+    str | None
+        The self-contained HTML of the graph, or None if PyVis is unavailable.
+    """
+    # Imported lazily so the rest of the app keeps working if PyVis is missing.
+    try:
+        from pyvis.network import Network
+    except ImportError:
+        st.warning("📦 PyVis is not installed. Run `pip install pyvis` to enable "
+                   "the interactive subgraph visualization.")
+        return None
+
+    net = Network(height=height, width="100%", bgcolor="#ffffff",
+                  font_color="#222222", directed=True, notebook=False,
+                  cdn_resources="in_line")
+
+    # Force-directed layout for a well-spaced, draggable graph.
+    net.barnes_hut(gravity=-12000, central_gravity=0.3,
+                   spring_length=180, spring_strength=0.02)
+
+    # ── Central Cluster node ──────────────────────────────────────────────
+    cluster_node = f"cluster_{cluster_id}"
+    net.add_node(
+        cluster_node,
+        label=f"Cluster {cluster_id}",
+        title=f"Epidemiological cluster {cluster_id} assigned by the KNN model",
+        color="#7B2FF7",          # violet — distinctive
+        size=45,
+        shape="dot",
+        font={"size": 22, "color": "#222222", "face": "arial"},
+    )
+
+    # ── Active Patient node ───────────────────────────────────────────────
+    patient_tooltip = "<b>Current Patient</b><br>" + "<br>".join(
+        f"{k}: {v}" for k, v in patient_data.items()
+    )
+    net.add_node(
+        "patient_active",
+        label="Current Patient",
+        title=patient_tooltip,
+        color="#FF2D78",          # bright pink — highlighted
+        size=32,
+        shape="dot",
+        font={"size": 18, "color": "#222222", "face": "arial"},
+    )
+    net.add_edge("patient_active", cluster_node, label="BELONGS_TO",
+                 color="#FF2D78", width=3)
+
+    # ── Metric nodes (Neo4j statistics) ───────────────────────────────────
+    for i, (label, value) in enumerate(cluster_stats.items()):
+        metric_node = f"metric_{i}"
+        net.add_node(
+            metric_node,
+            label=f"{label}\n{value}",
+            title=f"{label}: {value} (aggregated from Neo4j)",
+            color="#2ECC71",      # neutral green
+            size=22,
+            shape="box",
+            font={"size": 14, "color": "#ffffff", "face": "arial"},
+        )
+        net.add_edge(cluster_node, metric_node, color="#95A5A6", width=2)
+
+    # Interaction options: drag, zoom, hover tooltips.
+    net.set_options("""
+    {
+      "interaction": { "hover": true, "dragNodes": true, "zoomView": true, "navigationButtons": true },
+      "physics": { "stabilization": { "iterations": 200 } }
+    }
+    """)
+
+    # ── HTML generation ───────────────────────────────────────────────────
+    # Prefer generate_html(): it returns the HTML in memory, avoiding PyVis'
+    # save_graph() which writes with the Windows locale encoding (cp1252) and
+    # crashes on Unicode characters. Fall back to a UTF-8 temp file otherwise.
+    try:
+        html = net.generate_html(notebook=False)
+    except TypeError:
+        html = net.generate_html()
+    except Exception:
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".html",
+                                             delete=False, encoding="utf-8") as tmp:
+                tmp_path = tmp.name
+            net.write_html(tmp_path, notebook=False)
+            with open(tmp_path, "r", encoding="utf-8") as f:
+                html = f.read()
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    return html
+
+
+# =====================================================================
+# 3. STREAMLIT USER INTERFACE (CDC Diabetes)
+# =====================================================================
+st.set_page_config(page_title="GraphRAG - Diabetes Epidemiology IFI", layout="wide")
+st.title("📊 GraphRAG Epidemiological Assistant — Diabetes")
+st.subheader("KNN Routing (99.2%) & Contextual Extraction via Neo4j")
+
+st.markdown("---")
+
+# Input form based on the 9 CDC attributes
+st.sidebar.header("📥 Patient Clinical Profile")
+
+high_bp       = st.sidebar.selectbox("High Blood Pressure (HighBP)",         options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
+high_chol     = st.sidebar.selectbox("High Cholesterol (HighChol)",          options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
+bmi           = st.sidebar.number_input("Body Mass Index (BMI)",             min_value=10.0, max_value=60.0, value=25.0, step=0.1)
+smoker        = st.sidebar.selectbox("Regular Smoker (Smoker)",              options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
+stroke        = st.sidebar.selectbox("History of Stroke (Stroke)",           options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
+heart_disease = st.sidebar.selectbox("Heart Disease / Heart Attack",         options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
+phys_activity = st.sidebar.selectbox("Regular Physical Activity",            options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
+gen_hlth      = st.sidebar.slider("Perceived General Health (1: Excellent - 5: Poor)", min_value=1, max_value=5,  value=3)
+age           = st.sidebar.slider("CDC Age Category (1: 18-24 years ... 13: 80 years and over)", min_value=1, max_value=13, value=5)
+
+if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
+
+    if knn_model is None or scaler_model is None:
+        st.error("Analysis not possible: the .pkl files could not be found.")
+    else:
+        # =================================================================
+        # STEP 1: Alignment and prediction by the KNN (9 variables)
+        # =================================================================
+        donnees_patient    = np.array([[high_bp, high_chol, bmi, smoker, stroke,
+                                        heart_disease, phys_activity, gen_hlth, age]])
+        donnees_normalisees = scaler_model.transform(donnees_patient)
+        cluster_predit      = int(knn_model.predict(donnees_normalisees)[0])
+
+        st.success(f"### 🤖 KNN Routing: Patient assigned to **Cluster {cluster_predit}**")
+
+        col1, col2 = st.columns(2)
+
+        # =================================================================
+        # STEP 2: Extraction of the epidemiological context from Neo4j
+        # =================================================================
+        context_texte  = ""
+        latency_cypher = 0.0
+        cluster_stats  = {}   # readable metrics for the interactive subgraph
+
+        with st.spinner("Retrieving subgraph data from Neo4j..."):
+            try:
+                with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
+                    start_time = time.perf_counter()
+
+                    with driver.session() as session:
+                        query = """
+                        MATCH (p:Patient)-[:HAS_STAY]->(s:Stay)-[:BELONGS_TO]->(c:Cluster {cluster_id: $cid})
+                        RETURN
+                            count(p)                                             AS TotalPatients,
+                            avg(toFloat(p.BMI))                                  AS AvgBMI,
+                            avg(toFloat(p.Age))                                  AS AvgAge,
+                            sum(toInteger(p.HighBP))  * 100.0 / count(p)        AS TauxHypertension,
+                            sum(toInteger(p.HighChol)) * 100.0 / count(p)       AS TauxCholesterol
+                        """
+                        result = session.run(query, cid=cluster_predit)
+                        record = result.single()
+
+                    latency_cypher = time.perf_counter() - start_time
+
+                    if record and record['TotalPatients'] > 0:
+                        avg_bmi = record['AvgBMI']           if record['AvgBMI']           is not None else 0.0
+                        avg_age = record['AvgAge']           if record['AvgAge']           is not None else 0.0
+                        t_bp    = record['TauxHypertension'] if record['TauxHypertension'] is not None else 0.0
+                        t_chol  = record['TauxCholesterol']  if record['TauxCholesterol']  is not None else 0.0
+
+                        context_texte = (
+                            f"Total number of patients in this cluster: {record['TotalPatients']}\n"
+                            f"Group mean BMI: {avg_bmi:.2f}\n"
+                            f"Group mean age: {avg_age:.2f}\n"
+                            f"Hypertension rate in this group: {t_bp:.1f}%\n"
+                            f"High cholesterol rate: {t_chol:.1f}%"
+                        )
+
+                        # Same figures, structured for the interactive subgraph.
+                        cluster_stats = {
+                            "Total Patients":    int(record['TotalPatients']),
+                            "Mean BMI":          f"{avg_bmi:.2f}",
+                            "Mean Age":          f"{avg_age:.2f}",
+                            "Hypertension Rate": f"{t_bp:.1f}%",
+                            "Cholesterol Rate":  f"{t_chol:.1f}%",
+                        }
+            except Exception as e:
+                st.error(f"Error while querying the Neo4j graph: {e}")
+
+        with col1:
+            st.write("### 📊 Extracted Epidemiological Context (Neo4j)")
+            if context_texte:
+                st.markdown(f"**Global indicators for Cluster {cluster_predit}:**\n\n" + context_texte)
+                st.caption(f"⏱️ Cypher computation latency: {latency_cypher:.4f} seconds")
+            else:
+                st.warning("No historical metrics found for this cluster.")
+                context_texte = "Statistical data unavailable."
+
+        # =================================================================
+        # STEP 3: RAG generation by Mistral AI & hallucination measurement
+        # =================================================================
+        with col2:
+            st.write("### 🧠 Risk Assessment Report (Mistral AI)")
+            with st.spinner("Generating the clinical summary..."):
+
+                prompt = f"""
+                You are an expert epidemiologist and a high-level AI medical assistant.
+                A new patient presents the following clinical characteristics:
+                - Hypertension: {high_bp}, Cholesterol: {high_chol}, BMI: {bmi},
+                  Smoker: {smoker}, Stroke: {stroke}, Cardiac Risk: {heart_disease},
+                  Physical Activity: {phys_activity}, General Health Score: {gen_hlth}/5,
+                  Age Category: {age}/13.
+
+                Our KNN model assigned the patient to epidemiological Cluster {cluster_predit}.
+                Here are the real, consolidated health statistics extracted from our
+                Neo4j knowledge graph for this specific cluster:
+                {context_texte}
+
+                Based strictly on these pre-computed graph data and on the patient's
+                profile, write a risk assessment summary (250 words max).
+                1. Analyze the patient's position relative to the averages of their group
+                   (e.g., BMI, Hypertension).
+                2. Give 2 targeted preventive-medicine recommendations to limit the risks.
+                Be factual, rigorous, and do not invent any figure outside the provided context.
+                Write the entire report in English.
+                """
+
+                try:
+                    chat_response = mistral_client.chat.complete(
+                        model="mistral-large-latest",
+                        temperature=0.2,   # Section 3.9 — fixed for reproducibility
+                        messages=[{"role": "user", "content": prompt}]
+                    )
+                    rapport_genere = chat_response.choices[0].message.content
+
+                    # Display of the clinical report
+                    st.info(rapport_genere)
+
+                    # ✅ profil_clinique defined BEFORE the call,
+                    #    3 arguments passed in the correct order
+                    profil_clinique = [
+                        high_bp, high_chol, bmi, smoker, stroke,
+                        heart_disease, phys_activity, gen_hlth, age
+                    ]
+
+                    th_n, total_stats, liste_anomalies = evaluer_hallucinations_numeriques(
+                        rapport_genere,   # 1. report generated by the LLM
+                        context_texte,    # 2. context extracted from the Neo4j graph
+                        profil_clinique,  # 3. raw values from the patient form
+                        latency_cypher    # 4. Cypher latency → anti-false-positive whitelist
+                    )
+
+                    # Display of the confidence metrics
+                    st.markdown("---")
+                    if th_n == 0.0:
+                        st.success(
+                            f"🛡️ **GraphRAG Safety:** Numeric hallucination rate measured at "
+                            f"**{th_n}%** (absolute fidelity to the facts — {total_stats} values verified)."
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ **Audit Alert:** Numeric hallucination rate at **{th_n}%**. "
+                            f"Out-of-context figures detected: {liste_anomalies}"
+                        )
+
+                except Exception as e:
+                    st.error(f"Error during generation with Mistral AI: {e}")
+
+        # =================================================================
+        # STEP 4: Neo4j panel — context + interactive subgraph (in tabs)
+        # =================================================================
+        st.markdown("---")
+        tab_context, tab_graph = st.tabs(
+            ["📊 Neo4j Context", "🕸️ Subgraph Visualization"]
+        )
+
+        with tab_context:
+            if context_texte and cluster_stats:
+                st.markdown(
+                    f"**Global indicators for Cluster {cluster_predit}:**\n\n" + context_texte
+                )
+                st.caption(f"⏱️ Cypher computation latency: {latency_cypher:.4f} seconds")
+            else:
+                st.info("No Neo4j metrics available for this cluster.")
+
+        with tab_graph:
+            if cluster_stats:
+                # Readable clinical profile of the active patient (for tooltips).
+                patient_data_view = {
+                    "High Blood Pressure": high_bp,
+                    "High Cholesterol":    high_chol,
+                    "BMI":                 bmi,
+                    "Smoker":              smoker,
+                    "Stroke":              stroke,
+                    "Heart Disease":       heart_disease,
+                    "Physical Activity":   phys_activity,
+                    "General Health":      f"{gen_hlth}/5",
+                    "Age Category":        f"{age}/13",
+                }
+                graph_html = render_neo4j_subgraph(
+                    cluster_predit, patient_data_view, cluster_stats
+                )
+                if graph_html:
+                    components.html(graph_html, height=560, scrolling=True)
+                    st.caption(
+                        "Central node = assigned cluster (violet) · "
+                        "pink node = current patient (BELONGS_TO) · "
+                        "green nodes = aggregated Neo4j metrics."
+                    )
+            else:
+                st.info("The subgraph will be displayed once Neo4j metrics are available "
+                        "for this cluster.")

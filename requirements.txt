@@ -1,0 +1,12 @@
+# Pinned to match the versions that created/serialized the .pkl model,
+# so joblib.load() stays compatible on Streamlit Community Cloud.
+streamlit==1.49.1
+scikit-learn==1.7.1
+numpy==2.2.6
+scipy==1.16.2
+pandas==2.3.2
+joblib==1.5.2
+neo4j==6.1.0
+mistralai==1.2.5
+python-dotenv==1.0.1
+pyvis==0.3.2
