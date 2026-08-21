@@ -212,7 +212,8 @@ def evaluer_hallucinations_numeriques(rapport_llm, contexte_graph, donnees_patie
 # 2bis. INTERACTIVE NEO4J SUBGRAPH VISUALIZATION (PyVis)
 # =====================================================================
 
-def render_neo4j_subgraph(cluster_id, patient_data, cluster_stats, height="520px"):
+def render_neo4j_subgraph(cluster_id, patient_data, cluster_stats, height="520px",
+                          patient_label="Current Patient"):
     """
     Build an interactive HTML view of the Neo4j subgraph for the analyzed patient.
 
@@ -269,12 +270,12 @@ def render_neo4j_subgraph(cluster_id, patient_data, cluster_stats, height="520px
     )
 
     # ── Active Patient node ───────────────────────────────────────────────
-    patient_tooltip = "<b>Current Patient</b><br>" + "<br>".join(
+    patient_tooltip = f"<b>{patient_label}</b><br>" + "<br>".join(
         f"{k}: {v}" for k, v in patient_data.items()
     )
     net.add_node(
         "patient_active",
-        label="Current Patient",
+        label=patient_label,
         title=patient_tooltip,
         color="#FF2D78",          # bright pink — highlighted
         size=32,
@@ -333,29 +334,147 @@ def render_neo4j_subgraph(cluster_id, patient_data, cluster_stats, height="520px
 # =====================================================================
 # 3. STREAMLIT USER INTERFACE (CDC Diabetes)
 # =====================================================================
-st.set_page_config(page_title="GraphRAG - Diabetes Epidemiology IFI", layout="wide")
-st.title("📊 GraphRAG Epidemiological Assistant — Diabetes")
-st.subheader("KNN Routing (99.2%) & Contextual Extraction via Neo4j")
+st.set_page_config(page_title="GraphRAG — Diabetes Epidemiology IFI", layout="wide")
+
+# =====================================================================
+# i18n — Bilingual interface (English / French)
+# =====================================================================
+TRANSLATIONS = {
+    "en": {
+        "title": "📊 GraphRAG Epidemiological Assistant — Diabetes",
+        "subheader": "KNN Routing (99.2%) & Contextual Extraction via Neo4j",
+        "sidebar_header": "📥 Patient Clinical Profile",
+        "opt_no": "No (0)", "opt_yes": "Yes (1)",
+        "f_highbp": "High Blood Pressure (HighBP)",
+        "f_highchol": "High Cholesterol (HighChol)",
+        "f_bmi": "Body Mass Index (BMI)",
+        "f_smoker": "Regular Smoker (Smoker)",
+        "f_stroke": "History of Stroke (Stroke)",
+        "f_heart": "Heart Disease / Heart Attack",
+        "f_phys": "Regular Physical Activity",
+        "f_genhlth": "Perceived General Health (1: Excellent - 5: Poor)",
+        "f_age": "CDC Age Category (1: 18-24 years ... 13: 80 years and over)",
+        "run_button": "🚀 Run GraphRAG Analysis",
+        "err_pkl": "Analysis not possible: the .pkl files could not be found.",
+        "knn_success": "### 🤖 KNN Routing: Patient assigned to **Cluster {cid}**",
+        "spinner_neo4j": "Retrieving subgraph data from Neo4j...",
+        "ctx_total": "Total number of patients in this cluster: {n}",
+        "ctx_bmi": "Group mean BMI: {v:.2f}",
+        "ctx_age": "Group mean age: {v:.2f}",
+        "ctx_hta": "Hypertension rate in this group: {v:.1f}%",
+        "ctx_chol": "High cholesterol rate: {v:.1f}%",
+        "stat_total": "Total Patients", "stat_bmi": "Mean BMI", "stat_age": "Mean Age",
+        "stat_hta": "Hypertension Rate", "stat_chol": "Cholesterol Rate",
+        "err_neo4j": "Error while querying the Neo4j graph: {e}",
+        "col1_title": "### 📊 Extracted Epidemiological Context (Neo4j)",
+        "indicators": "**Global indicators for Cluster {cid}:**",
+        "latency": "⏱️ Cypher computation latency: {lat:.4f} seconds",
+        "no_metrics": "No historical metrics found for this cluster.",
+        "stats_unavailable": "Statistical data unavailable.",
+        "col2_title": "### 🧠 Risk Assessment Report (Mistral AI)",
+        "spinner_mistral": "Generating the clinical summary...",
+        "report_language": "English",
+        "safety_ok": "🛡️ **GraphRAG Safety:** Numeric hallucination rate measured at "
+                     "**{th}%** (absolute fidelity to the facts — {n} values verified).",
+        "audit_alert": "⚠️ **Audit Alert:** Numeric hallucination rate at **{th}%**. "
+                       "Out-of-context figures detected: {anom}",
+        "err_mistral": "Error during generation with Mistral AI: {e}",
+        "tab_context": "📊 Neo4j Context", "tab_graph": "🕸️ Subgraph Visualization",
+        "no_neo4j": "No Neo4j metrics available for this cluster.",
+        "subgraph_caption": "Central node = assigned cluster (violet) · "
+                            "pink node = current patient (BELONGS_TO) · "
+                            "green nodes = aggregated Neo4j metrics.",
+        "subgraph_info": "The subgraph will be displayed once Neo4j metrics are "
+                         "available for this cluster.",
+        "graph_patient_label": "Current Patient",
+        "pf_highbp": "High Blood Pressure", "pf_highchol": "High Cholesterol",
+        "pf_bmi": "BMI", "pf_smoker": "Smoker", "pf_stroke": "Stroke",
+        "pf_heart": "Heart Disease", "pf_phys": "Physical Activity",
+        "pf_genhlth": "General Health", "pf_age": "Age Category",
+    },
+    "fr": {
+        "title": "📊 Assistant épidémiologique GraphRAG — Diabète",
+        "subheader": "Routage KNN (99,2 %) & extraction contextuelle via Neo4j",
+        "sidebar_header": "📥 Profil clinique du patient",
+        "opt_no": "Non (0)", "opt_yes": "Oui (1)",
+        "f_highbp": "Hypertension artérielle (HighBP)",
+        "f_highchol": "Cholestérol élevé (HighChol)",
+        "f_bmi": "Indice de masse corporelle (IMC)",
+        "f_smoker": "Fumeur régulier (Smoker)",
+        "f_stroke": "Antécédent d'AVC (Stroke)",
+        "f_heart": "Maladie cardiaque / Infarctus",
+        "f_phys": "Activité physique régulière",
+        "f_genhlth": "Santé générale perçue (1 : Excellente - 5 : Mauvaise)",
+        "f_age": "Catégorie d'âge CDC (1 : 18-24 ans ... 13 : 80 ans et plus)",
+        "run_button": "🚀 Lancer l'analyse GraphRAG",
+        "err_pkl": "Analyse impossible : les fichiers .pkl sont introuvables.",
+        "knn_success": "### 🤖 Routage KNN : patient assigné au **Cluster {cid}**",
+        "spinner_neo4j": "Récupération des données du sous-graphe depuis Neo4j...",
+        "ctx_total": "Nombre total de patients dans ce cluster : {n}",
+        "ctx_bmi": "IMC moyen du groupe : {v:.2f}",
+        "ctx_age": "Âge moyen du groupe : {v:.2f}",
+        "ctx_hta": "Taux d'hypertension dans ce groupe : {v:.1f}%",
+        "ctx_chol": "Taux de cholestérol élevé : {v:.1f}%",
+        "stat_total": "Patients", "stat_bmi": "IMC moyen", "stat_age": "Âge moyen",
+        "stat_hta": "Taux d'HTA", "stat_chol": "Taux cholestérol",
+        "err_neo4j": "Erreur lors de l'interrogation du graphe Neo4j : {e}",
+        "col1_title": "### 📊 Contexte épidémiologique extrait (Neo4j)",
+        "indicators": "**Indicateurs globaux du Cluster {cid} :**",
+        "latency": "⏱️ Latence de calcul Cypher : {lat:.4f} secondes",
+        "no_metrics": "Aucune métrique historique trouvée pour ce cluster.",
+        "stats_unavailable": "Données statistiques indisponibles.",
+        "col2_title": "### 🧠 Rapport d'évaluation du risque (Mistral AI)",
+        "spinner_mistral": "Génération de la synthèse clinique...",
+        "report_language": "French",
+        "safety_ok": "🛡️ **Sûreté GraphRAG :** taux d'hallucination numérique mesuré à "
+                     "**{th} %** (fidélité absolue aux faits — {n} valeurs vérifiées).",
+        "audit_alert": "⚠️ **Alerte audit :** taux d'hallucination numérique à **{th} %**. "
+                       "Chiffres hors contexte détectés : {anom}",
+        "err_mistral": "Erreur lors de la génération avec Mistral AI : {e}",
+        "tab_context": "📊 Contexte Neo4j", "tab_graph": "🕸️ Visualisation du sous-graphe",
+        "no_neo4j": "Aucune métrique Neo4j disponible pour ce cluster.",
+        "subgraph_caption": "Nœud central = cluster assigné (violet) · "
+                            "nœud rose = patient courant (BELONGS_TO) · "
+                            "nœuds verts = métriques Neo4j agrégées.",
+        "subgraph_info": "Le sous-graphe s'affichera dès que les métriques Neo4j "
+                         "seront disponibles pour ce cluster.",
+        "graph_patient_label": "Patient courant",
+        "pf_highbp": "Hypertension artérielle", "pf_highchol": "Cholestérol élevé",
+        "pf_bmi": "IMC", "pf_smoker": "Fumeur", "pf_stroke": "AVC",
+        "pf_heart": "Maladie cardiaque", "pf_phys": "Activité physique",
+        "pf_genhlth": "Santé générale", "pf_age": "Catégorie d'âge",
+    },
+}
+
+_lang_choice = st.sidebar.radio("🌐 Language / Langue", ["English", "Français"],
+                                horizontal=True)
+lang = "fr" if _lang_choice == "Français" else "en"
+T = TRANSLATIONS[lang]
+
+st.title(T["title"])
+st.subheader(T["subheader"])
 
 st.markdown("---")
 
 # Input form based on the 9 CDC attributes
-st.sidebar.header("📥 Patient Clinical Profile")
+st.sidebar.header(T["sidebar_header"])
 
-high_bp       = st.sidebar.selectbox("High Blood Pressure (HighBP)",         options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
-high_chol     = st.sidebar.selectbox("High Cholesterol (HighChol)",          options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
-bmi           = st.sidebar.number_input("Body Mass Index (BMI)",             min_value=10.0, max_value=60.0, value=25.0, step=0.1)
-smoker        = st.sidebar.selectbox("Regular Smoker (Smoker)",              options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
-stroke        = st.sidebar.selectbox("History of Stroke (Stroke)",           options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
-heart_disease = st.sidebar.selectbox("Heart Disease / Heart Attack",         options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
-phys_activity = st.sidebar.selectbox("Regular Physical Activity",            options=[0, 1], format_func=lambda x: "No (0)" if x == 0 else "Yes (1)")
-gen_hlth      = st.sidebar.slider("Perceived General Health (1: Excellent - 5: Poor)", min_value=1, max_value=5,  value=3)
-age           = st.sidebar.slider("CDC Age Category (1: 18-24 years ... 13: 80 years and over)", min_value=1, max_value=13, value=5)
+_fmt_bool = lambda x: T["opt_no"] if x == 0 else T["opt_yes"]
 
-if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
+high_bp       = st.sidebar.selectbox(T["f_highbp"],   options=[0, 1], format_func=_fmt_bool)
+high_chol     = st.sidebar.selectbox(T["f_highchol"], options=[0, 1], format_func=_fmt_bool)
+bmi           = st.sidebar.number_input(T["f_bmi"],   min_value=10.0, max_value=60.0, value=25.0, step=0.1)
+smoker        = st.sidebar.selectbox(T["f_smoker"],   options=[0, 1], format_func=_fmt_bool)
+stroke        = st.sidebar.selectbox(T["f_stroke"],   options=[0, 1], format_func=_fmt_bool)
+heart_disease = st.sidebar.selectbox(T["f_heart"],    options=[0, 1], format_func=_fmt_bool)
+phys_activity = st.sidebar.selectbox(T["f_phys"],     options=[0, 1], format_func=_fmt_bool)
+gen_hlth      = st.sidebar.slider(T["f_genhlth"], min_value=1, max_value=5,  value=3)
+age           = st.sidebar.slider(T["f_age"],    min_value=1, max_value=13, value=5)
+
+if st.sidebar.button(T["run_button"], type="primary"):
 
     if knn_model is None or scaler_model is None:
-        st.error("Analysis not possible: the .pkl files could not be found.")
+        st.error(T["err_pkl"])
     else:
         # =================================================================
         # STEP 1: Alignment and prediction by the KNN (9 variables)
@@ -365,7 +484,7 @@ if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
         donnees_normalisees = scaler_model.transform(donnees_patient)
         cluster_predit      = int(knn_model.predict(donnees_normalisees)[0])
 
-        st.success(f"### 🤖 KNN Routing: Patient assigned to **Cluster {cluster_predit}**")
+        st.success(T["knn_success"].format(cid=cluster_predit))
 
         col1, col2 = st.columns(2)
 
@@ -376,7 +495,7 @@ if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
         latency_cypher = 0.0
         cluster_stats  = {}   # readable metrics for the interactive subgraph
 
-        with st.spinner("Retrieving subgraph data from Neo4j..."):
+        with st.spinner(T["spinner_neo4j"]):
             try:
                 with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
                     start_time = time.perf_counter()
@@ -403,39 +522,39 @@ if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
                         t_chol  = record['TauxCholesterol']  if record['TauxCholesterol']  is not None else 0.0
 
                         context_texte = (
-                            f"Total number of patients in this cluster: {record['TotalPatients']}\n"
-                            f"Group mean BMI: {avg_bmi:.2f}\n"
-                            f"Group mean age: {avg_age:.2f}\n"
-                            f"Hypertension rate in this group: {t_bp:.1f}%\n"
-                            f"High cholesterol rate: {t_chol:.1f}%"
+                            T["ctx_total"].format(n=record['TotalPatients']) + "\n"
+                            + T["ctx_bmi"].format(v=avg_bmi) + "\n"
+                            + T["ctx_age"].format(v=avg_age) + "\n"
+                            + T["ctx_hta"].format(v=t_bp) + "\n"
+                            + T["ctx_chol"].format(v=t_chol)
                         )
 
                         # Same figures, structured for the interactive subgraph.
                         cluster_stats = {
-                            "Total Patients":    int(record['TotalPatients']),
-                            "Mean BMI":          f"{avg_bmi:.2f}",
-                            "Mean Age":          f"{avg_age:.2f}",
-                            "Hypertension Rate": f"{t_bp:.1f}%",
-                            "Cholesterol Rate":  f"{t_chol:.1f}%",
+                            T["stat_total"]: int(record['TotalPatients']),
+                            T["stat_bmi"]:   f"{avg_bmi:.2f}",
+                            T["stat_age"]:   f"{avg_age:.2f}",
+                            T["stat_hta"]:   f"{t_bp:.1f}%",
+                            T["stat_chol"]:  f"{t_chol:.1f}%",
                         }
             except Exception as e:
-                st.error(f"Error while querying the Neo4j graph: {e}")
+                st.error(T["err_neo4j"].format(e=e))
 
         with col1:
-            st.write("### 📊 Extracted Epidemiological Context (Neo4j)")
+            st.write(T["col1_title"])
             if context_texte:
-                st.markdown(f"**Global indicators for Cluster {cluster_predit}:**\n\n" + context_texte)
-                st.caption(f"⏱️ Cypher computation latency: {latency_cypher:.4f} seconds")
+                st.markdown(T["indicators"].format(cid=cluster_predit) + "\n\n" + context_texte)
+                st.caption(T["latency"].format(lat=latency_cypher))
             else:
-                st.warning("No historical metrics found for this cluster.")
-                context_texte = "Statistical data unavailable."
+                st.warning(T["no_metrics"])
+                context_texte = T["stats_unavailable"]
 
         # =================================================================
         # STEP 3: RAG generation by Mistral AI & hallucination measurement
         # =================================================================
         with col2:
-            st.write("### 🧠 Risk Assessment Report (Mistral AI)")
-            with st.spinner("Generating the clinical summary..."):
+            st.write(T["col2_title"])
+            with st.spinner(T["spinner_mistral"]):
 
                 prompt = f"""
                 You are an expert epidemiologist and a high-level AI medical assistant.
@@ -456,7 +575,7 @@ if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
                    (e.g., BMI, Hypertension).
                 2. Give 2 targeted preventive-medicine recommendations to limit the risks.
                 Be factual, rigorous, and do not invent any figure outside the provided context.
-                Write the entire report in English.
+                Write the entire report in {T['report_language']}.
                 """
 
                 try:
@@ -487,60 +606,46 @@ if st.sidebar.button("🚀 Run GraphRAG Analysis", type="primary"):
                     # Display of the confidence metrics
                     st.markdown("---")
                     if th_n == 0.0:
-                        st.success(
-                            f"🛡️ **GraphRAG Safety:** Numeric hallucination rate measured at "
-                            f"**{th_n}%** (absolute fidelity to the facts — {total_stats} values verified)."
-                        )
+                        st.success(T["safety_ok"].format(th=th_n, n=total_stats))
                     else:
-                        st.warning(
-                            f"⚠️ **Audit Alert:** Numeric hallucination rate at **{th_n}%**. "
-                            f"Out-of-context figures detected: {liste_anomalies}"
-                        )
+                        st.warning(T["audit_alert"].format(th=th_n, anom=liste_anomalies))
 
                 except Exception as e:
-                    st.error(f"Error during generation with Mistral AI: {e}")
+                    st.error(T["err_mistral"].format(e=e))
 
         # =================================================================
         # STEP 4: Neo4j panel — context + interactive subgraph (in tabs)
         # =================================================================
         st.markdown("---")
-        tab_context, tab_graph = st.tabs(
-            ["📊 Neo4j Context", "🕸️ Subgraph Visualization"]
-        )
+        tab_context, tab_graph = st.tabs([T["tab_context"], T["tab_graph"]])
 
         with tab_context:
             if context_texte and cluster_stats:
-                st.markdown(
-                    f"**Global indicators for Cluster {cluster_predit}:**\n\n" + context_texte
-                )
-                st.caption(f"⏱️ Cypher computation latency: {latency_cypher:.4f} seconds")
+                st.markdown(T["indicators"].format(cid=cluster_predit) + "\n\n" + context_texte)
+                st.caption(T["latency"].format(lat=latency_cypher))
             else:
-                st.info("No Neo4j metrics available for this cluster.")
+                st.info(T["no_neo4j"])
 
         with tab_graph:
             if cluster_stats:
                 # Readable clinical profile of the active patient (for tooltips).
                 patient_data_view = {
-                    "High Blood Pressure": high_bp,
-                    "High Cholesterol":    high_chol,
-                    "BMI":                 bmi,
-                    "Smoker":              smoker,
-                    "Stroke":              stroke,
-                    "Heart Disease":       heart_disease,
-                    "Physical Activity":   phys_activity,
-                    "General Health":      f"{gen_hlth}/5",
-                    "Age Category":        f"{age}/13",
+                    T["pf_highbp"]:   high_bp,
+                    T["pf_highchol"]: high_chol,
+                    T["pf_bmi"]:      bmi,
+                    T["pf_smoker"]:   smoker,
+                    T["pf_stroke"]:   stroke,
+                    T["pf_heart"]:    heart_disease,
+                    T["pf_phys"]:     phys_activity,
+                    T["pf_genhlth"]:  f"{gen_hlth}/5",
+                    T["pf_age"]:      f"{age}/13",
                 }
                 graph_html = render_neo4j_subgraph(
-                    cluster_predit, patient_data_view, cluster_stats
+                    cluster_predit, patient_data_view, cluster_stats,
+                    patient_label=T["graph_patient_label"]
                 )
                 if graph_html:
                     components.html(graph_html, height=560, scrolling=True)
-                    st.caption(
-                        "Central node = assigned cluster (violet) · "
-                        "pink node = current patient (BELONGS_TO) · "
-                        "green nodes = aggregated Neo4j metrics."
-                    )
+                    st.caption(T["subgraph_caption"])
             else:
-                st.info("The subgraph will be displayed once Neo4j metrics are available "
-                        "for this cluster.")
+                st.info(T["subgraph_info"])
