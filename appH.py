@@ -580,7 +580,7 @@ if st.sidebar.button(T["run_button"], type="primary"):
 
                 try:
                     chat_response = mistral_client.chat.complete(
-                        model="mistral-small-latest",
+                        model="mistral-large-latest",
                         temperature=0.2,   # Section 3.9 — fixed for reproducibility
                         messages=[{"role": "user", "content": prompt}]
                     )
