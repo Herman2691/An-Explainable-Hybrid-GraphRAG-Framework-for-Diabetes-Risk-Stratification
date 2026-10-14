@@ -11,4 +11,5 @@ joblib
 neo4j
 mistralai==1.2.5
 python-dotenv
+requests
 pyvis
