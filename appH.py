@@ -68,7 +68,7 @@ mistral_client = Mistral(api_key=MISTRAL_API_KEY)
 # Fallback LLM: Groq (free tier), used only when Mistral fails (error, timeout, quota).
 # The Groq API is OpenAI-compatible, so a plain HTTPS call is enough.
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
-GROQ_MODEL = get_secret("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = get_secret("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
@@ -93,7 +93,10 @@ def generer_rapport(prompt):
             json={"model": GROQ_MODEL, "temperature": 0.2, "messages": messages},
             timeout=60,
         )
-        response.raise_for_status()
+        if not response.ok:
+            # Surface Groq's own message (e.g. model_not_found) instead of a bare HTTP code.
+            raise RuntimeError(f"Groq HTTP {response.status_code}: {response.text[:300]} "
+                               f"(Mistral error: {mistral_err})")
         texte = response.json()["choices"][0]["message"]["content"]
         return texte, f"Groq ({GROQ_MODEL})", mistral_err
 
